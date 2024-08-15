@@ -1,0 +1,301 @@
+- name: Install and configure Postfix, OpenDKIM, and check DNS records
+  hosts: ubuntu_servers
+  become: yes
+
+  vars:
+    kuma_container_name: uptime_kuma
+    kuma_image: louislam/uptime-kuma:latest
+    kuma_port: 3001
+    kuma_domain: monitor.graulzone.de
+    email: node01@graulzone.de
+    mail_domain: graulzone.de
+    dkim_selector: mail
+    dkim_key_length: 2048
+    ansible_venv_path: /opt/ansible-venv  # Ensure this variable is defined
+    opendkim_socket: "inet:12301@localhost" # OpenDKIM socket configuration
+
+  tasks:
+    - name: Ensure Python is installed
+      apt:
+        name: python3
+        state: present
+
+    - name: Ensure Python pip is installed
+      apt:
+        name: python3-pip
+        state: present
+
+    - name: Ensure virtualenv is installed
+      apt:
+        name: python3-venv
+        state: present
+
+    - name: Create virtual environment for Ansible
+      command: python3 -m venv {{ ansible_venv_path }}
+      args:
+        creates: "{{ ansible_venv_path }}"
+
+    - name: Install Ansible in virtual environment
+      command: "{{ ansible_venv_path }}/bin/pip install ansible"
+      args:
+        creates: "{{ ansible_venv_path }}/bin/ansible"
+
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - postfix
+          - opendkim
+          - opendkim-tools
+          - mailutils
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu lunar stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Pull Uptime Kuma Docker image
+      docker_image:
+        name: "{{ kuma_image }}"
+        source: pull
+
+    - name: Run Uptime Kuma container
+      docker_container:
+        name: "{{ kuma_container_name }}"
+        image: "{{ kuma_image }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "127.0.0.1:{{ kuma_port }}:3001"
+
+    - name: Configure Nginx for Uptime Kuma (HTTP)
+      template:
+        src: nginx_http.conf.j2
+        dest: /etc/nginx/sites-available/{{ kuma_domain }}
+        mode: '0644'
+      notify:
+        - Reload Nginx
+
+    - name: Enable Nginx site configuration
+      file:
+        src: /etc/nginx/sites-available/{{ kuma_domain }}
+        dest: /etc/nginx/sites-enabled/{{ kuma_domain }}
+        state: link
+
+    - name: Remove default Nginx site configuration
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify:
+        - Reload Nginx
+
+    - name: Obtain SSL certificate from Let's Encrypt
+      command: certbot --nginx -d {{ kuma_domain }} --non-interactive --agree-tos --email {{ email }}
+      args:
+        creates: /etc/letsencrypt/live/{{ kuma_domain }}/fullchain.pem
+
+    - name: Configure Nginx for Uptime Kuma (HTTPS)
+      template:
+        src: nginx_https.conf.j2
+        dest: /etc/nginx/sites-available/{{ kuma_domain }}
+        mode: '0644'
+      notify:
+        - Reload Nginx
+
+    - name: Setup Certbot auto-renewal
+      cron:
+        name: "Certbot auto-renewal"
+        job: "0 3 * * * certbot renew --quiet"
+        user: root
+
+    - name: Install and configure Postfix
+      template:
+        src: main.cf.j2
+        dest: /etc/postfix/main.cf
+        mode: '0644'
+      notify:
+        - Restart Postfix
+
+    - name: Create OpenDKIM directories
+      file:
+        path: "/etc/opendkim/keys/{{ mail_domain }}"
+        state: directory
+        owner: opendkim
+        group: opendkim
+        mode: '0755'
+
+    - name: Ensure /run/opendkim directory exists
+      file:
+        path: /run/opendkim
+        state: directory
+        owner: opendkim
+        group: opendkim
+        mode: '0755'
+
+    - name: Ensure /var/run/opendkim directory permissions
+      file:
+        path: /var/run/opendkim
+        state: directory
+        owner: opendkim
+        group: opendkim
+        mode: '0755'
+
+    - name: Remove any existing directory for signing.table
+      file:
+        path: /etc/opendkim/signing.table
+        state: absent
+        force: yes
+
+    - name: Configure OpenDKIM signing table
+      copy:
+        content: |
+          *@{{ mail_domain }} {{ mail_domain }}:{{ dkim_selector }}
+        dest: /etc/opendkim/signing.table
+        owner: opendkim
+        group: opendkim
+        mode: '0644'
+
+    - name: Remove any existing directory for key.table
+      file:
+        path: /etc/opendkim/key.table
+        state: absent
+        force: yes
+
+    - name: Configure OpenDKIM key table
+      copy:
+        content: |
+          {{ mail_domain }} {{ mail_domain }}:{{ dkim_selector }}:/etc/opendkim/keys/{{ mail_domain }}/{{ dkim_selector }}.private
+        dest: /etc/opendkim/key.table
+        owner: opendkim
+        group: opendkim
+        mode: '0644'
+
+    - name: Remove any existing directory for trusted.hosts
+      file:
+        path: /etc/opendkim/trusted.hosts
+        state: absent
+        force: yes
+
+    - name: Configure OpenDKIM trusted hosts
+      copy:
+        content: |
+          127.0.0.1
+          localhost
+        dest: /etc/opendkim/trusted.hosts
+        owner: opendkim
+        group: opendkim
+        mode: '0644'
+
+    - name: Verify OpenDKIM configuration
+      command: opendkim -n
+      register: opendkim_verify
+      failed_when: opendkim_verify.rc != 0
+
+    - name: Display OpenDKIM configuration verification results
+      debug:
+        var: opendkim_verify
+
+    - name: Ensure OpenDKIM configuration is valid
+      command: opendkim-testkey -d {{ mail_domain }} -s {{ dkim_selector }}
+      register: opendkim_testkey
+      ignore_errors: yes
+
+    - name: Display OpenDKIM test results
+      debug:
+        var: opendkim_testkey
+      when: opendkim_testkey.rc == 0
+
+    - name: Configure OpenDKIM
+      template:
+        src: opendkim.conf.j2
+        dest: /etc/opendkim.conf
+        mode: '0644'
+      notify:
+        - Restart OpenDKIM
+
+    - name: Add OpenDKIM to Postfix
+      lineinfile:
+        path: /etc/postfix/main.cf
+        regexp: '^smtpd_milters'
+        line: 'smtpd_milters = inet:localhost:12301'
+        state: present
+      notify:
+        - Restart Postfix
+
+    - name: Add OpenDKIM to Postfix (non_smtpd_milters)
+      lineinfile:
+        path: /etc/postfix/main.cf
+        regexp: '^non_smtpd_milters'
+        line: 'non_smtpd_milters = inet:localhost:12301'
+        state: present
+      notify:
+        - Restart Postfix
+
+    - name: Restart Postfix
+      service:
+        name: postfix
+        state: restarted
+
+    - name: Restart OpenDKIM
+      service:
+        name: opendkim
+        state: restarted
+
+    - name: Check DNS records for DKIM
+      command: dig TXT {{ dkim_selector }}._domainkey.{{ mail_domain }} +short
+      register: dkim_dns_record
+      failed_when: dkim_dns_record.rc != 0
+
+    - name: Display DKIM DNS record if not set
+      debug:
+        msg: |
+          Set the following DNS TXT record for DKIM:
+          Name: {{ dkim_selector }}._domainkey.{{ mail_domain }}
+          Value: "{{ lookup('file', '/etc/opendkim/keys/{{ mail_domain }}/{{ dkim_selector }}.txt') }}"
+      when: dkim_dns_record.stdout == ''
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart Postfix
+      service:
+        name: postfix
+        state: restarted
+
+    - name: Restart OpenDKIM
+      service:
+        name: opendkim
+        state: restarted

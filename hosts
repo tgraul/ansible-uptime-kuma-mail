@@ -1,0 +1,2 @@
+[ubuntu_servers]
+195.201.133.200 ansible_user=tgraul ansible_host=195.201.133.200
